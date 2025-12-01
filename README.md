@@ -1,7 +1,6 @@
 
 # ✅ **A) README.md (Production Quality)**
 
-Create a file at:
 # **ConvoNest – WhatsApp SaaS Platform (Django + Next.js + PostgreSQL)**
 
 ConvoNest is a modern WhatsApp Automation & Messaging SaaS platform designed for MSMEs, startups, and enterprises.
