@@ -1,21 +1,7 @@
-Here comes the good stuff — a **professional README.md** tailored for your WhatsApp SaaS project, plus a **clean Git branching strategy** used by real SaaS engineering teams (main/dev/feature workflow).
-
-You can copy-paste the README directly into your repo.
-
----
 
 # ✅ **A) README.md (Production Quality)**
 
 Create a file at:
-
-```
-/README.md
-```
-
-And paste the following:
-
----
-
 # **ConvoNest – WhatsApp SaaS Platform (Django + Next.js + PostgreSQL)**
 
 ConvoNest is a modern WhatsApp Automation & Messaging SaaS platform designed for MSMEs, startups, and enterprises.
