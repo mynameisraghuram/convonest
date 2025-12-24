@@ -1,6 +1,8 @@
-from django.urls import path
-from .views import ping
+# backend/apps/contacts/urls.py
+from rest_framework.routers import DefaultRouter
+from .views import ContactViewSet
 
-urlpatterns = [
-    path("ping/", ping),
-]
+router = DefaultRouter()
+router.register(r"contacts", ContactViewSet, basename="contact")
+
+urlpatterns = router.urls

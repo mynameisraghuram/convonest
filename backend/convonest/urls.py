@@ -14,6 +14,7 @@ Including another URLconf
     1. Import the include() function: from django.urls import include, path
     2. Add a URL to urlpatterns:  path('blog/', include('blog.urls'))
 """
+# backend/convonest/urls.py
 from django.contrib import admin
 from django.urls import path, include
 
@@ -24,6 +25,9 @@ urlpatterns = [
     path('api/accounts/', include('apps.accounts.urls')),
     path('api/contacts/', include('apps.contacts.urls')),
     path('api/messaging/', include('apps.messaging.urls')),
-    path('api/templates/', include('apps.templates.urls')),
+    path("api/templates/", include("apps.templates.urls")),
     path('api/webhooks/', include('apps.webhooks.urls')),
+    path('api/whatsapp/', include('apps.whatsapp_accounts.urls')),
+    path("api/core/", include("apps.core.urls")),
+
 ]
