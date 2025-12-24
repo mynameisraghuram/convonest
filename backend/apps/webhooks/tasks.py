@@ -1,11 +1,11 @@
 # backend/apps/webhooks/tasks.py
-
 from __future__ import annotations
 
 import logging
 from typing import Any, Dict, List, Optional
 
 from celery import shared_task
+from django.db import transaction
 from django.utils import timezone
 
 from .models import WebhookEventLog, WebhookProcessingStatus
@@ -15,20 +15,13 @@ from apps.messaging.models import (
     MessageLog,
     MessageType,
     MessageDirection,
-    MessageStatus,               
-     
+    MessageStatus,
 )
 
 logger = logging.getLogger(__name__)
 
 
 def _normalize_phone(raw: Optional[str]) -> str:
-    """
-    Very simple normaliser for WhatsApp numbers.
-
-    Cloud API usually sends '919876543210' (no +).
-    For now we just ensure it's prefixed with +.
-    """
     if not raw:
         return ""
     raw = raw.strip()
@@ -38,12 +31,7 @@ def _normalize_phone(raw: Optional[str]) -> str:
 
 
 def _map_msg_type(type_str: Optional[str]) -> MessageType:
-    """
-    Map WhatsApp Cloud API 'type' (text, image, audio, etc.)
-    to our internal MessageType enum.
-    """
     t = (type_str or "").upper()
-
     mapping = {
         "TEXT": MessageType.TEXT,
         "IMAGE": MessageType.IMAGE,
@@ -59,9 +47,6 @@ def _map_msg_type(type_str: Optional[str]) -> MessageType:
 
 
 def _extract_body_text(msg: Dict[str, Any]) -> str:
-    """
-    Extract human-readable text from a WhatsApp message payload.
-    """
     msg_type = msg.get("type")
 
     if msg_type == "text":
@@ -98,52 +83,92 @@ def _extract_body_text(msg: Dict[str, Any]) -> str:
     return "[unknown message type]"
 
 
-@shared_task
-def process_webhook_event(event_id: int) -> None:
+def _extract_value_blocks(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
-    Processes a single WebhookEventLog from WhatsApp Cloud API:
+    Return a list of value dicts for each entry/change.
+    """
+    entries: List[Dict[str, Any]] = payload.get("entry") or []
+    values: List[Dict[str, Any]] = []
+    for entry in entries:
+        for change in (entry.get("changes") or []):
+            values.append(change.get("value") or {})
+    return values
 
-      - Parses entry[] / changes[] / value
-      - For each inbound message:
-          * Normalise phone
-          * Upsert Contact (touch_contact_from_inbound)
-          * Create MessageLog(direction=IN, status=RECEIVED)
+
+def _map_meta_status(status: str) -> Optional[MessageStatus]:
+    s = (status or "").upper()
+    mapping = {
+        "SENT": getattr(MessageStatus, "SENT", None),
+        "DELIVERED": getattr(MessageStatus, "DELIVERED", None),
+        "READ": getattr(MessageStatus, "READ", None),
+        "FAILED": getattr(MessageStatus, "FAILED", None),
+    }
+    return mapping.get(s)
+
+
+def _ts_to_dt(ts: Optional[str]) -> Optional[timezone.datetime]:
     """
+    Meta sends timestamps as string seconds-since-epoch.
+    Convert to timezone-aware datetime.
+    """
+    if not ts:
+        return None
     try:
-        event = WebhookEventLog.objects.get(id=event_id)
+        return timezone.datetime.fromtimestamp(
+            int(ts),
+            tz=timezone.get_current_timezone(),
+        )
+    except Exception:
+        return None
+
+
+@shared_task(
+    bind=True,
+    autoretry_for=(Exception,),
+    retry_backoff=True,
+    retry_kwargs={"max_retries": 8},
+)
+def process_webhook_event(self, event_id: int) -> None:
+    try:
+        event = WebhookEventLog.objects.select_related("workspace").get(id=event_id)
     except WebhookEventLog.DoesNotExist:
         logger.warning("WebhookEventLog %s does not exist", event_id)
         return
 
-    event.delivery_attempts += 1
+    # Count attempts
+    event.delivery_attempts = (event.delivery_attempts or 0) + 1
+    event.save(update_fields=["delivery_attempts", "updated_at"])
+
+    # If already processed, exit safely
+    if event.processing_status == WebhookProcessingStatus.PROCESSED:
+        return
+
+    # Workspace is required to write messages/contacts in a multi-tenant system
+    if event.workspace is None:
+        event.processing_status = WebhookProcessingStatus.FAILED
+        event.error_message = "Unroutable webhook event: workspace is NULL"
+        event.processed_at = timezone.now()
+        event.save(update_fields=["processing_status", "error_message", "processed_at", "updated_at"])
+        return
 
     try:
         payload: Dict[str, Any] = event.payload or {}
-        entries: List[Dict[str, Any]] = payload.get("entry") or []
+        values = _extract_value_blocks(payload)
 
-        if not entries:
-            logger.info("WebhookEventLog %s has no 'entry'; skipping.", event_id)
+        if not values:
             event.processing_status = WebhookProcessingStatus.PROCESSED
             event.processed_at = timezone.now()
             event.error_message = ""
-            event.save(
-                update_fields=[
-                    "processing_status",
-                    "processed_at",
-                    "error_message",
-                    "delivery_attempts",
-                ]
-            )
+            event.save(update_fields=["processing_status", "processed_at", "error_message", "updated_at"])
             return
 
-        for entry in entries:
-            changes: List[Dict[str, Any]] = entry.get("changes") or []
-            for change in changes:
-                value: Dict[str, Any] = change.get("value") or {}
-
+        with transaction.atomic():
+            for value in values:
                 metadata = value.get("metadata") or {}
-                waba_phone_number_id = metadata.get("phone_number_id")
+                # Prefer metadata phone_number_id; fall back to what's stored on event (if you have it)
+                waba_phone_number_id = metadata.get("phone_number_id") or getattr(event, "phone_number_id", None)
 
+                # contacts block (profile name + wa_id)
                 wa_contacts = value.get("contacts") or []
                 wa_profile_name = ""
                 wa_contact_wa_id = None
@@ -152,69 +177,138 @@ def process_webhook_event(event_id: int) -> None:
                     wa_profile_name = (c0.get("profile") or {}).get("name", "")
                     wa_contact_wa_id = c0.get("wa_id")
 
+                # 1) inbound messages
                 messages = value.get("messages") or []
-                if not messages:
-                    continue
-
                 for msg in messages:
-                    # 1) Basic identifiers
-                    wa_from = msg.get("from")  # e.g. "919876543210"
+                    wa_from = msg.get("from")  # "9198..."
                     if not wa_from:
-                        logger.info("Message without 'from' in event %s; skipping.", event_id)
                         continue
 
                     normalized_phone = _normalize_phone(wa_from)
                     profile_name = wa_profile_name or (msg.get("profile") or {}).get("name", "")
                     wa_msg_id = msg.get("id")
+                    if not wa_msg_id:
+                        # Without message id, we can't dedupe reliably; skip to avoid duplicates.
+                        logger.warning("Inbound message missing id, event_id=%s", event_id)
+                        continue
 
-                    # 2) Ensure Contact exists
+                    # Contact upsert (workspace-scoped)
+                    # IMPORTANT: wa_id should be wa_contact_wa_id or wa_from (NOT message id)
                     contact = touch_contact_from_inbound(
+                        workspace=event.workspace,
                         phone=normalized_phone,
                         full_name=profile_name,
-                        extra={"wa_id": wa_contact_wa_id or wa_msg_id},
+                        extra={"wa_id": wa_contact_wa_id or wa_from},
                     )
 
-                    # 3) Message content
                     msg_type = _map_msg_type(msg.get("type"))
                     body_text = _extract_body_text(msg)
+                    msg_dt = _ts_to_dt(msg.get("timestamp"))
 
-                    # 4) Create MessageLog (inbound)
-                    MessageLog.objects.create(
-                        direction=MessageDirection.IN,         # 👈 IN (not INBOUND)
-                        msg_type=msg_type,
-                        status=MessageStatus.RECEIVED,        # 👈 RECEIVED for inbound
-                        contact=contact,
-                        contact_phone=normalized_phone,
-                        waba_phone_number_id=waba_phone_number_id,
+                    # ✅ Idempotent insert scoped by workspace + waba_message_id
+                    ml, created = MessageLog.objects.get_or_create(
+                        workspace=event.workspace,
                         waba_message_id=wa_msg_id,
-                        context_message_id=(msg.get("context") or {}).get("id"),
-                        body_text=body_text,
-                        payload=msg,
-                        received_at=timezone.now(),
+                        defaults={
+                            "direction": MessageDirection.INBOUND,
+                            "msg_type": msg_type,
+                            "status": MessageStatus.RECEIVED,
+                            "contact": contact,
+                            "contact_phone": normalized_phone,
+                            "waba_phone_number_id": waba_phone_number_id,
+                            "context_message_id": (msg.get("context") or {}).get("id"),
+                            "body_text": body_text,
+                            "payload": msg,
+                            "received_at": msg_dt or timezone.now(),
+                        },
                     )
+
+                    # If duplicate webhook arrives, patch missing info safely
+                    if not created:
+                        updates: Dict[str, Any] = {}
+                        if ml.contact_id is None and contact is not None:
+                            updates["contact"] = contact
+                        if not ml.body_text and body_text:
+                            updates["body_text"] = body_text
+                        if not ml.payload:
+                            updates["payload"] = msg
+                        if ml.received_at is None:
+                            updates["received_at"] = msg_dt or timezone.now()
+
+                        if updates:
+                            for k, v in updates.items():
+                                setattr(ml, k, v)
+                            ml.save(update_fields=list(updates.keys()) + ["updated_at"])
+
+                # 2) status updates (usually for outbound messages)
+                statuses = value.get("statuses") or []
+                for st in statuses:
+                    wamid = st.get("id")
+                    new_status = _map_meta_status(st.get("status"))
+
+                    if not wamid or not new_status:
+                        continue
+
+                    st_dt = _ts_to_dt(st.get("timestamp"))
+
+                    ml = (
+                        MessageLog.objects.filter(
+                            workspace=event.workspace,
+                            waba_message_id=wamid,
+                        ).first()
+                    )
+                    if not ml:
+                        continue
+
+                    # ✅ Safer MVP rule: only apply Meta statuses to outbound messages
+                    if ml.direction != MessageDirection.OUTBOUND:
+                        continue
+
+                    # Only move status forward (avoid downgrades)
+                    rank = {
+                        MessageStatus.QUEUED: 0,
+                        MessageStatus.SENT: 1,
+                        MessageStatus.DELIVERED: 2,
+                        MessageStatus.READ: 3,
+                        MessageStatus.FAILED: 99,
+                        MessageStatus.RECEIVED: 50,  # inbound bucket
+                    }
+
+                    updates: Dict[str, Any] = {}
+
+                    if rank.get(new_status, 0) >= rank.get(ml.status, 0):
+                        updates["status"] = new_status
+
+                    if new_status == MessageStatus.SENT and ml.sent_at is None:
+                        updates["sent_at"] = st_dt or timezone.now()
+
+                    if new_status == MessageStatus.DELIVERED and ml.delivered_at is None:
+                        updates["delivered_at"] = st_dt or timezone.now()
+
+                    if new_status == MessageStatus.READ and ml.read_at is None:
+                        updates["read_at"] = st_dt or timezone.now()
+
+                    if new_status == MessageStatus.FAILED:
+                        errs = st.get("errors") or []
+                        if errs:
+                            e0 = errs[0]
+                            updates["error_code"] = str(e0.get("code") or "")
+                            updates["error_message"] = e0.get("title") or e0.get("message") or ""
+
+                    if updates:
+                        for k, v in updates.items():
+                            setattr(ml, k, v)
+                        ml.save(update_fields=list(updates.keys()) + ["updated_at"])
 
         event.processing_status = WebhookProcessingStatus.PROCESSED
         event.processed_at = timezone.now()
         event.error_message = ""
-        event.save(
-            update_fields=[
-                "processing_status",
-                "processed_at",
-                "error_message",
-                "delivery_attempts",
-            ]
-        )
+        event.save(update_fields=["processing_status", "processed_at", "error_message", "updated_at"])
 
     except Exception as exc:  # noqa: BLE001
         logger.exception("Error processing webhook event %s: %s", event_id, exc)
         event.processing_status = WebhookProcessingStatus.FAILED
         event.error_message = str(exc)
         event.processed_at = timezone.now()
-        event.save(
-            update_fields=[
-                "processing_status",
-                "error_message",
-                "processed_at",
-                "delivery_attempts",
-            ]
-        )
+        event.save(update_fields=["processing_status", "error_message", "processed_at", "updated_at"])
+        raise

@@ -1,110 +1,144 @@
 # backend/apps/webhooks/views.py
+
 from __future__ import annotations
 
-from django.conf import settings
-from django.utils import timezone
-from rest_framework.views import APIView
-from rest_framework.response import Response
-from rest_framework.permissions import AllowAny
+import hashlib
+import json
+import logging
+from typing import Any, Dict, Optional
 
-from apps.contacts.services import touch_contact_from_inbound
-from apps.messaging.models import MessageLog, MessageDirection, MessageStatus, MessageType
+from django.conf import settings
+from django.http import HttpRequest, HttpResponse, JsonResponse
+from rest_framework.permissions import AllowAny
+from rest_framework.views import APIView
+
+from apps.whatsapp_accounts.models import WhatsappConnection
+from .models import WebhookEventLog, WebhookProcessingStatus
+from .tasks import process_webhook_event
+
+logger = logging.getLogger(__name__)
+
+
+def _extract_phone_number_id(payload: Dict[str, Any]) -> Optional[str]:
+    """
+    Meta Cloud API webhook commonly includes metadata.phone_number_id.
+    """
+    try:
+        entry0 = (payload.get("entry") or [])[0]
+        change0 = (entry0.get("changes") or [])[0]
+        value = change0.get("value") or {}
+        metadata = value.get("metadata") or {}
+        return metadata.get("phone_number_id")
+    except Exception:
+        return None
+
+
+def _compute_dedupe_key(payload: Dict[str, Any]) -> str:
+    """
+    Prefer a stable key from message/status ids.
+    Fallback to hash of normalized payload.
+    """
+    msg_id = None
+    status_id = None
+    try:
+        entry0 = (payload.get("entry") or [])[0]
+        change0 = (entry0.get("changes") or [])[0]
+        value = change0.get("value") or {}
+        messages = value.get("messages") or []
+        statuses = value.get("statuses") or []
+        if messages:
+            msg_id = messages[0].get("id")
+        if statuses:
+            status_id = statuses[0].get("id")
+    except Exception:
+        pass
+
+    base = msg_id or status_id
+    if base:
+        return f"meta:{base}"
+
+    # fallback: stable hash of JSON
+    blob = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return "meta:hash:" + hashlib.sha256(blob).hexdigest()
 
 
 class WhatsAppWebhookView(APIView):
+    """
+    Single ingress for WhatsApp Cloud API webhooks.
+
+    GET: verify token challenge
+    POST: store raw payload and enqueue Celery processing
+    """
+    authentication_classes: list = []
     permission_classes = [AllowAny]
 
-    def get(self, request):
-        """
-        Meta webhook verification:
-        ?hub.mode=subscribe&hub.verify_token=...&hub.challenge=...
-        """
-        mode = request.query_params.get("hub.mode")
-        token = request.query_params.get("hub.verify_token")
-        challenge = request.query_params.get("hub.challenge")
+    def get(self, request: HttpRequest, *args: Any, **kwargs: Any) -> HttpResponse:
+        mode = request.GET.get("hub.mode")
+        token = request.GET.get("hub.verify_token")
+        challenge = request.GET.get("hub.challenge")
 
-        verify_token = getattr(settings, "WHATSAPP_WEBHOOK_VERIFY_TOKEN", None)
+        expected = getattr(settings, "META_VERIFY_TOKEN", None)
+        if mode == "subscribe" and expected and token == expected and challenge:
+            return HttpResponse(challenge, content_type="text/plain")
 
-        if mode == "subscribe" and token and verify_token and token == verify_token:
-            return Response(challenge, status=200)
+        return HttpResponse("Verification failed", status=403, content_type="text/plain")
 
-        return Response({"detail": "Verification failed"}, status=403)
+    def post(self, request: HttpRequest, *args: Any, **kwargs: Any) -> HttpResponse:
+        payload = request.data if isinstance(request.data, dict) else {}
+        dedupe_key = _compute_dedupe_key(payload)
 
-    def post(self, request):
-        """
-        Receives WhatsApp webhook payloads.
-        For Phase-1: store inbound text + simple media metadata.
-        """
-        data = request.data or {}
+        phone_number_id = _extract_phone_number_id(payload)
+        if not phone_number_id:
+            ev = WebhookEventLog.objects.create(
+                workspace=None,
+                provider="META_WHATSAPP",
+                phone_number_id="",
+                dedupe_key=dedupe_key,
+                payload=payload,
+                processing_status=WebhookProcessingStatus.FAILED,
+                error_message="Missing metadata.phone_number_id",
+                request_headers=dict(request.headers),
+                query_params=request.GET.dict(),
+            )
+            logger.warning("Webhook missing phone_number_id, event_id=%s", ev.id)
+            return JsonResponse({"ok": True})
 
-        # Defensive parsing (Meta shape is nested)
-        entries = data.get("entry") or []
-        for entry in entries:
-            changes = entry.get("changes") or []
-            for change in changes:
-                value = change.get("value") or {}
-                messages = value.get("messages") or []
-                contacts = value.get("contacts") or []
+        conn = (
+            WhatsappConnection.objects.filter(phone_number_id=phone_number_id)
+            .select_related("workspace")
+            .first()
+        )
+        if not conn:
+            ev = WebhookEventLog.objects.create(
+                workspace=None,
+                provider="META_WHATSAPP",
+                phone_number_id=phone_number_id,
+                dedupe_key=dedupe_key,
+                payload=payload,
+                processing_status=WebhookProcessingStatus.FAILED,
+                error_message=f"Unknown phone_number_id: {phone_number_id}",
+                request_headers=dict(request.headers),
+                query_params=request.GET.dict(),
+            )
+            logger.warning("Webhook for unknown phone_number_id=%s event_id=%s", phone_number_id, ev.id)
+            return JsonResponse({"ok": True})
 
-                # From contacts block we can pick profile name (optional)
-                name_by_wa_id = {}
-                for c in contacts:
-                    wa_id = c.get("wa_id")
-                    profile = c.get("profile") or {}
-                    if wa_id:
-                        name_by_wa_id[wa_id] = profile.get("name") or ""
+        # Dedupe at DB level for known workspace
+        ev, created = WebhookEventLog.objects.get_or_create(
+            workspace=conn.workspace,
+            provider="META_WHATSAPP",
+            dedupe_key=dedupe_key,
+            defaults={
+                "phone_number_id": phone_number_id,
+                "payload": payload,
+                "processing_status": WebhookProcessingStatus.PENDING,
+                "request_headers": dict(request.headers),
+                "query_params": request.GET.dict(),
+            },
+        )
 
-                for msg in messages:
-                    from_phone = msg.get("from")  # wa_id (digits), not +E164
-                    msg_id = msg.get("id")
-                    mtype = (msg.get("type") or "unknown").lower()
+        if created:
+            process_webhook_event.delay(str(ev.id))
 
-                    # store best-effort phone. You can normalize later.
-                    phone_guess = f"+{from_phone}" if from_phone and not str(from_phone).startswith("+") else (from_phone or "")
+        return JsonResponse({"ok": True})
 
-                    body_text = ""
-                    msg_type = MessageType.UNKNOWN
-                    payload = msg
-
-                    if mtype == "text":
-                        body_text = ((msg.get("text") or {}).get("body")) or ""
-                        msg_type = MessageType.TEXT
-                    elif mtype == "image":
-                        body_text = ((msg.get("image") or {}).get("caption")) or ""
-                        msg_type = MessageType.IMAGE
-                    elif mtype == "video":
-                        body_text = ((msg.get("video") or {}).get("caption")) or ""
-                        msg_type = MessageType.VIDEO
-                    elif mtype == "audio":
-                        msg_type = MessageType.AUDIO
-                    elif mtype == "document":
-                        body_text = ((msg.get("document") or {}).get("caption")) or ""
-                        msg_type = MessageType.DOCUMENT
-                    elif mtype == "interactive":
-                        msg_type = MessageType.INTERACTIVE
-                        body_text = "interactive"
-                    else:
-                        msg_type = MessageType.UNKNOWN
-
-                    # Ensure contact exists / touched
-                    full_name = name_by_wa_id.get(from_phone, "")
-                    contact = touch_contact_from_inbound(
-                        phone=phone_guess,
-                        full_name=full_name or None,
-                        language="en",
-                        extra={"wa_id": from_phone} if from_phone else None,
-                    )
-
-                    MessageLog.objects.create(
-                        direction=MessageDirection.INBOUND,
-                        msg_type=msg_type,
-                        status=MessageStatus.RECEIVED,
-                        waba_message_id=msg_id,
-                        contact=contact,
-                        contact_phone=contact.phone,
-                        body_text=body_text,
-                        payload=payload,
-                        received_at=timezone.now(),
-                    )
-
-        return Response({"ok": True}, status=200)

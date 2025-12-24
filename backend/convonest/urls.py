@@ -18,16 +18,19 @@ Including another URLconf
 from django.contrib import admin
 from django.urls import path, include
 
+
 urlpatterns = [
-    path('admin/', admin.site.urls),
+    path("admin/", admin.site.urls),
 
-    # API routes (we will create these modules slowly)
-    path('api/accounts/', include('apps.accounts.urls')),
-    path('api/contacts/', include('apps.contacts.urls')),
-    path('api/messaging/', include('apps.messaging.urls')),
+    # Public webhook (Meta calls this)
+    path("webhooks/", include("apps.webhooks.urls")),
+
+
+    # API routes
+    path("api/accounts/", include("apps.accounts.urls")),
+    path("api/contacts/", include("apps.contacts.urls")),
+    path("api/messaging/", include("apps.messaging.urls")),
     path("api/templates/", include("apps.templates.urls")),
-    path('api/webhooks/', include('apps.webhooks.urls')),
-    path('api/whatsapp/', include('apps.whatsapp_accounts.urls')),
+    path("api/whatsapp/", include("apps.whatsapp_accounts.urls")),
     path("api/core/", include("apps.core.urls")),
-
 ]

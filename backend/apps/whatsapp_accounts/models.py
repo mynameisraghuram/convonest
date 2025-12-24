@@ -1,3 +1,5 @@
+# backend/apps/whatsapp_accounts/models.py
+
 from django.db import models
 from django.utils import timezone
 
@@ -123,6 +125,7 @@ class WhatsappConnection(models.Model):
 
     def __str__(self):
         return f"{self.workspace_id} → {self.phone_number_id}"
+
 
 
 class WhatsappContact(models.Model):
