@@ -31,6 +31,16 @@ class Contact(TimeStampedModel):
         db_index=True,
     )
 
+    workspace = models.ForeignKey(
+        "workspaces.Workspace",
+        on_delete=models.CASCADE,
+        related_name="contacts",
+        null=True,
+        blank=True,
+        db_index=True,
+    )
+
+
     email = models.EmailField(blank=True, null=True, db_index=True)
 
     language = models.CharField(
