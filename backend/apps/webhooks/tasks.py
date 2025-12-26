@@ -260,24 +260,31 @@ def process_webhook_event(self, event_id: int) -> None:
                     if not ml:
                         continue
 
-                    # ✅ Safer MVP rule: only apply Meta statuses to outbound messages
-                    if ml.direction != MessageDirection.OUTBOUND:
-                        continue
-
-                    # Only move status forward (avoid downgrades)
-                    rank = {
-                        MessageStatus.QUEUED: 0,
-                        MessageStatus.SENT: 1,
-                        MessageStatus.DELIVERED: 2,
-                        MessageStatus.READ: 3,
-                        MessageStatus.FAILED: 99,
-                        MessageStatus.RECEIVED: 50,  # inbound bucket
-                    }
-
                     updates: Dict[str, Any] = {}
 
-                    if rank.get(new_status, 0) >= rank.get(ml.status, 0):
-                        updates["status"] = new_status
+                    # ✅ OUTBOUND: keep strict rank-based forward-only transitions
+                    # ✅ INBOUND: allow DELIVERED/READ for testing (even if current is RECEIVED)
+                    if ml.direction == MessageDirection.INBOUND:
+                        if new_status in {MessageStatus.DELIVERED, MessageStatus.READ}:
+                            updates["status"] = new_status
+                        else:
+                            continue
+                    else:
+                        # Only move status forward (avoid downgrades)
+                        rank = {
+                            MessageStatus.QUEUED: 0,
+                            MessageStatus.SENT: 1,
+                            MessageStatus.DELIVERED: 2,
+                            MessageStatus.READ: 3,
+                            MessageStatus.FAILED: 99,
+                            # ⚠️ Don't let RECEIVED block outbound forward moves
+                            MessageStatus.RECEIVED: 0,
+                        }
+
+                        if rank.get(new_status, 0) >= rank.get(ml.status, 0):
+                            updates["status"] = new_status
+                        else:
+                            continue
 
                     if new_status == MessageStatus.SENT and ml.sent_at is None:
                         updates["sent_at"] = st_dt or timezone.now()

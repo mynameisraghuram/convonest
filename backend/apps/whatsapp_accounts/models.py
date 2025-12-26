@@ -89,7 +89,7 @@ class WhatsappConnection(models.Model):
     token_expires_at = models.DateTimeField(null=True, blank=True)
 
     # Webhook verification token (your server checks hub.verify_token against this)
-    verify_token = models.CharField(max_length=128)
+    verify_token = models.CharField(max_length=64)
 
     # Optional: useful for audits/debugging OAuth
     meta_user_id = models.CharField(max_length=64, blank=True, default="")

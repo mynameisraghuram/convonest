@@ -34,7 +34,11 @@ def _workspace_id_from_request(request):
     return (
         request.headers.get("X-Workspace-Id")
         or request.query_params.get("workspace_id")
-        or (request.data.get("workspace_id") if isinstance(getattr(request, "data", None), dict) else None)
+        or (
+            request.data.get("workspace_id")
+            if isinstance(getattr(request, "data", None), dict)
+            else None
+        )
     )
 
 
@@ -62,16 +66,13 @@ def oauth_start(request):
     auth_url = build_login_url(state=state)
 
     # If opened in browser, redirect. If called by API, return JSON.
-    # Trigger redirect by either:
-    #  - ?redirect=1
-    #  - Accept: text/html (browser usually sends this)
     accept = (request.headers.get("Accept") or "").lower()
     wants_redirect = request.query_params.get("redirect") in ("1", "true", "yes") or "text/html" in accept
 
     if wants_redirect:
         return HttpResponseRedirect(auth_url)
 
-    return Response({"auth_url": auth_url}) 
+    return Response({"auth_url": auth_url})
 
 
 @api_view(["GET"])
@@ -86,13 +87,15 @@ def oauth_callback(request):
     try:
         workspace_id = parse_oauth_state(state)["workspace_id"]
     except Exception as e:
-        return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response({"detail": f"Invalid state: {str(e)}"}, status=status.HTTP_400_BAD_REQUEST)
 
+    # 1) code -> short token
     short = exchange_code_for_short_token(code)
     short_token = short.get("access_token")
     if not short_token:
         return Response({"detail": "No short-lived access token returned", "raw": short}, status=400)
 
+    # 2) short token -> long token
     long = exchange_short_for_long_token(short_token)
     long_token = long.get("access_token")
     expires_in = long.get("expires_in")
@@ -104,19 +107,39 @@ def oauth_callback(request):
     if expires_in:
         token_expires_at = timezone.now() + timezone.timedelta(seconds=int(expires_in))
 
+    # 3) discover WABA + Phone
     waba_id, phone_number_id, meta_discovery = discover_waba_and_phone(long_token)
 
+    chosen_waba = meta_discovery.get("chosen_waba") or {}
+    chosen_phone = meta_discovery.get("chosen_phone") or {}
+
+    # Persist WABA
     waba, _ = WhatsappBusinessAccount.objects.update_or_create(
         id=waba_id,
-        defaults={"is_connected": True, "last_synced_at": timezone.now()},
+        defaults={
+            "is_connected": True,
+            "last_synced_at": timezone.now(),
+            "name": chosen_waba.get("name", "") or "",
+            "status": chosen_waba.get("account_review_status", "") or "",
+            "meta_raw": chosen_waba,
+        },
     )
 
+    # Persist Phone
     phone, _ = WhatsappPhoneNumber.objects.update_or_create(
         id=phone_number_id,
-        defaults={"waba": waba, "last_synced_at": timezone.now()},
+        defaults={
+            "waba": waba,
+            "last_synced_at": timezone.now(),
+            "e164_number": chosen_phone.get("display_phone_number", "") or "",
+            "display_name": chosen_phone.get("verified_name", "") or "",
+            "display_name_status": chosen_phone.get("name_status", "UNKNOWN") or "UNKNOWN",
+            "oba_status": chosen_phone.get("status", "UNKNOWN") or "UNKNOWN",
+            "meta_raw": chosen_phone,
+        },
     )
 
-    # MVP rule: one active connection per workspace
+    # MVP: one active connection per workspace
     WhatsappConnection.objects.filter(workspace_id=workspace_id, is_active=True).update(is_active=False)
 
     verify_token = secrets.token_urlsafe(18)
